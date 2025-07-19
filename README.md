@@ -1,6 +1,9 @@
 # Secure Chat Application
 
 A simple, secure web-based chat application built with Flask, SQLite, and end-to-end encryption (RSA-2048 & AES-256).
+<img width="1440" height="900" alt="Screenshot 2025-07-19 at 12 09 15" src="https://github.com/user-attachments/assets/b02df83f-ef9c-484b-b947-0bf99fa016f6" />
+![WhatsApp Image 2025-07-19 at 12 20 39](https://github.com/user-attachments/assets/945bcbdc-af97-46be-a02f-de6387d2d651)
+
 
 ## Quick Start: Run Locally
 
