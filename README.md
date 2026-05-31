@@ -1,131 +1,137 @@
-# Secure Chat Application
+# SocketStream
 
-A simple, secure web-based chat application built with Flask, SQLite, and end-to-end encryption (RSA-2048 & AES-256).
-<img width="1440" height="900" alt="Screenshot 2025-07-19 at 12 09 15" src="https://github.com/user-attachments/assets/b02df83f-ef9c-484b-b947-0bf99fa016f6" />
-![WhatsApp Image 2025-07-19 at 12 20 39](https://github.com/user-attachments/assets/945bcbdc-af97-46be-a02f-de6387d2d651)
+A end-to-end encrypted web chat where **the server never sees your messages or your private key**.
+Encryption happens entirely in the browser with the WebCrypto API; the Flask backend is a
+zero-knowledge relay that only ever stores public keys and ciphertext.
 
+> Rewritten from an earlier version that generated keys on the server and stored private keys in
+> the database. That design could read every message — this one cannot. See
+> [What changed](#what-changed-from-the-old-version).
 
-## Quick Start: Run Locally
+---
 
-1. **Clone this repository**
-   ```bash
-   git clone <your-repo-url>
-   cd <project-directory>
-   ```
-2. **(Recommended) Create a virtual environment**
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   ```
-3. **Install dependencies**
-   ```bash
-   pip install flask flask-bcrypt cryptography
-   ```
-4. **Run the server**
-   ```bash
-   python simple_secure_server.py
-   ```
-5. **Open your browser** and go to [https://localhost:5000](https://localhost:5000) (or the port shown in the terminal)
+## How it works (60-second version)
 
-> **Note:**
-> - Python 3.8+ is recommended.
-> - The server uses a self-signed SSL certificate for HTTPS. Your browser may warn you; you can safely proceed for local testing.
+- **Keys are born in your browser.** On registration, your browser generates an RSA-OAEP 2048
+  keypair. The **public** key is sent to the server; the **private** key never leaves the device.
+- **Your private key is wrapped with your password** (PBKDF2-SHA256, 200k iterations → AES-256-GCM)
+  and kept in `localStorage`. The server stores only a bcrypt hash of your password, so it cannot
+  derive the wrapping key.
+- **Every message uses hybrid encryption.** A fresh AES-256-GCM content key encrypts the text; that
+  key is RSA-wrapped to each recipient's public key. The server stores one ciphertext row per
+  recipient and relays it verbatim.
+- **The server is a dumb pipe.** It authenticates users, stores public keys + ciphertext, and pushes
+  ciphertext to recipients over WebSocket (with HTTP polling as a fallback). It has no code that can
+  decrypt anything.
+
+For the full threat model and honest limitations, read [SECURITY.md](SECURITY.md).
+For the deeper design, read [ARCHITECTURE.md](ARCHITECTURE.md).
+
+---
+
+## Quick start
+
+```bash
+git clone https://github.com/ROHITHSUDHAKAR15/SocketStream.git
+cd SocketStream
+
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+python simple_secure_server.py
+```
+
+Then open **https://localhost:5000**. The server generates a self-signed certificate on first run,
+so your browser will warn you once — that's expected for local development; proceed past it.
+
+> WebCrypto requires a *secure context*: HTTPS, or plain HTTP on `localhost` (localhost is treated as
+> secure). So the app works over plain HTTP locally too — handy behind a TLS-terminating proxy.
+
+### Configuration (environment variables)
+
+| Variable           | Default     | Purpose                                                        |
+|--------------------|-------------|----------------------------------------------------------------|
+| `SS_HOST`          | `127.0.0.1` | Bind address.                                                  |
+| `SS_PORT`          | `5000`      | Port.                                                          |
+| `SS_DEBUG`         | `0`         | Flask debug mode (keep `0` outside development).               |
+| `SS_TLS`           | `auto`      | `off` disables HTTPS (e.g. behind a proxy / local HTTP test).  |
+| `SS_COOKIE_SECURE` | `1`         | Send the session cookie only over HTTPS.                       |
+| `SS_SECRET_KEY`    | *(file)*    | Flask secret; if unset, persisted to `.flask_secret`.          |
+| `SS_DB`            | `secure_messaging.db` | SQLite database path.                               |
+
+See [.env.example](.env.example) for a copy-paste starting point.
+
+### Docker
+
+```bash
+docker compose up --build
+# → https://localhost:5000
+```
 
 ---
 
 ## Features
-- **Direct & Broadcast Messaging**: Private and public channels
-- **End-to-End Encryption**: RSA-2048 for key exchange, AES-256 for message content
-- **User Authentication**: Passwords hashed with bcrypt
-- **Web UI**: Modern Bootstrap 5 interface
-- **SSL/TLS**: HTTPS support for secure transport
-- **SQLite Database**: Lightweight, file-based storage
 
-## Setup
-1. **Clone the repository**
-   ```bash
-   git clone <your-repo-url>
-   cd <project-directory>
-   ```
-2. **Install dependencies**
-   ```bash
-   pip install flask flask-bcrypt cryptography
-   ```
-   (You may also need: `pip install pyopenssl` for SSL support)
-3. **Run the server**
-   ```bash
-   python simple_secure_server.py
-   ```
-4. **Access the app**
-   Open your browser to [https://localhost:5000](https://localhost:5000)
-
-## Security Notes
-- All messages are end-to-end encrypted. Only the intended recipient can decrypt direct messages.
-- Passwords are never stored in plain text; bcrypt is used for secure hashing.
-- SSL/TLS is enabled by default for secure transport.
-
-## Project Structure
-- `simple_secure_server.py` — Main Flask server
-- `templates/` — HTML templates
-- `static/` — CSS and JS files
-- `secure_messaging.db` — SQLite database (auto-created)
+- **Genuine end-to-end encryption** — RSA-OAEP-2048 key wrapping + AES-256-GCM message content,
+  all in-browser via WebCrypto. The server cannot read messages.
+- **Direct & broadcast messaging** — broadcasts are encrypted individually per recipient (no
+  plaintext fan-out).
+- **Real-time delivery** — Flask-SocketIO pushes ciphertext to recipients; HTTP polling is the
+  automatic fallback.
+- **Password-wrapped key custody** — your private key is encrypted at rest in the browser and
+  unlocked per session with your password.
+- **Encrypted key backup** — export/import a password-encrypted key file to use your account on a
+  new device.
+- **Hardening** — bcrypt password hashing, per-IP login rate limiting, HttpOnly/SameSite cookies,
+  XSS-safe rendering (`textContent`, never `innerHTML`), input validation, persisted secret key.
 
 ---
 
-## High-Level Design (HLD)
+## Testing
 
-### Architecture Overview
-- **Client-Server Model:**
-  - Web browser (client) communicates with Flask server (backend) over HTTPS.
-  - All data is stored in a local SQLite database.
-- **Main Components:**
-  - **Frontend:** HTML (Bootstrap 5), JavaScript for UI and API calls.
-  - **Backend:** Flask app with RESTful APIs for authentication, messaging, and user management.
-  - **Database:** SQLite for persistent storage of users and messages.
-  - **Security:** End-to-end encryption (RSA/AES), bcrypt password hashing, SSL/TLS for transport.
+```bash
+pip install -r requirements.txt
+pytest -q
+```
 
-### Data Flow
-1. **User Registration/Login:**
-   - User submits credentials via web form.
-   - Backend hashes password, generates RSA key pair, stores user in DB.
-2. **Sending a Message:**
-   - User enters message in UI.
-   - Message is encrypted (AES, RSA) and sent to backend via API.
-   - Backend stores encrypted message in DB.
-3. **Receiving a Message:**
-   - Client polls API for new messages.
-   - Backend returns encrypted messages.
-   - Client decrypts (if possible) and displays plain text.
+The suite (`tests/test_server.py`) verifies the server behaves as a zero-knowledge relay — including
+`test_db_never_stores_private_keys` (the schema has no private-key column) and
+`test_server_has_no_crypto_helpers` (the server has no decrypt code) — plus auth, validation, rate
+limiting, per-recipient ciphertext relay, and the message cursor.
 
 ---
 
-## Low-Level Design (LLD)
+## Project structure
 
-### Backend Modules
-- **simple_secure_server.py**
-  - `init_database()`: Initializes SQLite tables for users and messages.
-  - `register()`: Handles user registration, password hashing, key generation.
-  - `login()`: Authenticates users, manages sessions.
-  - `send_message()`: Encrypts and stores messages (direct/broadcast).
-  - `get_messages()`: Retrieves and decrypts messages for the user.
-  - `encrypt_message() / decrypt_message()`: Handles RSA/AES encryption logic.
-  - `save_user()`, `save_message()`: DB helper functions.
-
-### Frontend Modules
-- **templates/simple_chat.html**
-  - Bootstrap-based layout with panels for users, direct messages, and broadcast channel.
-  - JavaScript functions for sending/receiving messages, updating UI.
-  - Message display logic to show plain text to sender, encrypted blob to recipient if not decrypted.
-
-### Database Tables
-- **users**: id, username, password_hash, public_key, private_key, created_at
-- **messages**: id, sender, recipient, encrypted_message, timestamp
-
-### Security Details
-- **Password Hashing:** bcrypt
-- **Encryption:** RSA-2048 for key exchange, AES-256 for message content
-- **Transport:** HTTPS (self-signed cert for local dev)
+```
+simple_secure_server.py   Flask zero-knowledge relay (auth, public keys, ciphertext, realtime)
+static/js/crypto.js       WebCrypto module (keygen, wrap/unwrap, encrypt/decrypt) — runs in browser
+static/js/socket.io.min.js Vendored Socket.IO client (no external CDN dependency)
+static/css/style.css      Themed UI (design tokens, light + dark)
+templates/                register / login / chat (all crypto is client-side)
+tests/test_server.py      Pytest suite proving the relay never holds plaintext or private keys
+generate_certificates.py  Self-signed cert generator for local HTTPS
+Dockerfile, docker-compose.yml, .github/workflows/ci.yml
+SECURITY.md, ARCHITECTURE.md
+```
 
 ---
 
-For any issues or questions, please open an issue or contact the maintainer. 
+## What changed from the old version
+
+| | Old version | This version |
+|---|---|---|
+| Key generation | On the **server** | In the **browser** (WebCrypto) |
+| Private key storage | **Plaintext in the database** | Password-wrapped in the browser only |
+| Who can read messages | **The server** (it had the keys + decrypt code) | Only sender & recipient |
+| Message rendering | `innerHTML` (stored-XSS risk) | `textContent` (inert) |
+| Broadcast | In-memory, lost on restart | Per-recipient ciphertext, persisted |
+| Secret key | Regenerated each restart (sessions broke) | Persisted |
+| Config | Hard-coded, `debug=True` on `0.0.0.0` | Env-driven, safe defaults |
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).

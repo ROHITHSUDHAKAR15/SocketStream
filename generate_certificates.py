@@ -11,7 +11,7 @@ from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.backends import default_backend
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 def generate_self_signed_cert():
     """Generate a self-signed SSL certificate"""
@@ -41,9 +41,9 @@ def generate_self_signed_cert():
     ).serial_number(
         x509.random_serial_number()
     ).not_valid_before(
-        datetime.utcnow()
+        datetime.now(timezone.utc)
     ).not_valid_after(
-        datetime.utcnow() + timedelta(days=365)
+        datetime.now(timezone.utc) + timedelta(days=365)
     ).add_extension(
         x509.SubjectAlternativeName([
             x509.DNSName("localhost"),

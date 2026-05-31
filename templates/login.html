@@ -3,7 +3,7 @@
 {% block title %}Login - SocketStream{% endblock %}
 
 {% block content %}
-<div class="row justify-content-center">
+<div class="row justify-content-center align-items-center auth-shell">
     <div class="col-md-6 col-lg-4">
         <div class="card shadow">
             <div class="card-header bg-primary text-white text-center">
@@ -37,7 +37,9 @@
                 </form>
                 <hr>
                 <div class="text-center">
-                    <p>Don't have an account? <a href="/register" class="text-decoration-none">Register here</a></p>
+                    <p class="mb-1">Don't have an account? <a href="/register" class="text-decoration-none">Register here</a></p>
+                    <p class="mb-0"><small class="text-muted">New device? <a href="#" id="importKeyLink" class="text-decoration-none">Import your key backup</a></small></p>
+                    <input type="file" id="keyBackupFile" accept="application/json" class="d-none">
                 </div>
             </div>
         </div>
@@ -61,36 +63,75 @@ document.addEventListener('DOMContentLoaded', function() {
         this.querySelector('i').classList.toggle('fa-eye-slash');
     });
 
-    // Handle form submission
-    loginForm.addEventListener('submit', function(e) {
-        e.preventDefault();
-        
-        const formData = {
-            username: document.getElementById('username').value,
-            password: document.getElementById('password').value
-        };
+    const importKeyLink = document.getElementById('importKeyLink');
+    const keyBackupFile = document.getElementById('keyBackupFile');
+    let importedBlob = null;
 
-        fetch('/login', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(formData)
-        })
-        .then(response => response.json())
-        .then(data => {
-            if (data.success) {
-                showAlert('success', data.message);
-                setTimeout(() => {
-                    window.location.href = '/chat';
-                }, 1000);
-            } else {
+    importKeyLink.addEventListener('click', function(e) {
+        e.preventDefault();
+        keyBackupFile.click();
+    });
+    keyBackupFile.addEventListener('change', async function() {
+        const file = this.files[0];
+        if (!file) return;
+        try {
+            importedBlob = JSON.parse(await file.text());
+            showAlert('info', 'Key backup loaded. Enter your username & password and log in to unlock it.');
+        } catch (err) {
+            showAlert('danger', 'Could not read key backup file.');
+        }
+    });
+
+    // Unlock the local (or imported) private key with the password.
+    async function unlockKey(username, password) {
+        if (importedBlob) {
+            const key = await SSCrypto.unwrapPrivateKey(importedBlob, password);
+            SSCrypto.storeWrapped(username, importedBlob);   // persist on this device
+            await SSCrypto.cacheUnlocked(username, key);
+            return true;
+        }
+        if (SSCrypto.hasWrapped(username)) {
+            const key = await SSCrypto.unwrapPrivateKey(SSCrypto.loadWrapped(username), password);
+            await SSCrypto.cacheUnlocked(username, key);
+            return true;
+        }
+        return false; // authenticated, but no key on this device
+    }
+
+    loginForm.addEventListener('submit', async function(e) {
+        e.preventDefault();
+        const username = document.getElementById('username').value.trim();
+        const password = document.getElementById('password').value;
+        const submitBtn = loginForm.querySelector('button[type="submit"]');
+        submitBtn.disabled = true;
+
+        try {
+            const res = await fetch('/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, password })
+            });
+            const data = await res.json();
+            if (!data.success) {
                 showAlert('danger', data.message);
+                submitBtn.disabled = false;
+                return;
             }
-        })
-        .catch(error => {
-            showAlert('danger', 'An error occurred. Please try again.');
-        });
+
+            const unlocked = await unlockKey(username, password);
+            if (!unlocked) {
+                showAlert('warning', 'Logged in, but your private key is not on this device. ' +
+                    'Use "Import your key backup" to restore it, then log in again.');
+                submitBtn.disabled = false;
+                return;
+            }
+            showAlert('success', 'Unlocked. Redirecting...');
+            setTimeout(() => { window.location.href = '/chat'; }, 700);
+        } catch (err) {
+            // Wrong password fails AES-GCM auth during unwrap.
+            showAlert('danger', 'Could not unlock your key (wrong password?): ' + err.message);
+            submitBtn.disabled = false;
+        }
     });
 
     function showAlert(type, message) {

@@ -23,22 +23,13 @@
                 <h6><i class="fas fa-shield-alt"></i> Security</h6>
             </div>
             <div class="card-body">
-                <div class="d-flex align-items-center mb-2">
-                    <i class="fas fa-lock text-success me-2"></i>
-                    <small>E2E: <strong>Active</strong></small>
-                </div>
-                <div class="d-flex align-items-center mb-2">
-                    <i class="fas fa-key text-success me-2"></i>
-                    <small>RSA-2048: <strong>✓</strong></small>
-                </div>
-                <div class="d-flex align-items-center mb-2">
-                    <i class="fas fa-shield-alt text-success me-2"></i>
-                    <small>SSL/TLS: <strong>✓</strong></small>
-                </div>
-                <div class="d-flex align-items-center">
-                    <i class="fas fa-user-shield text-success me-2"></i>
-                    <small>Auth: <strong>Secure</strong></small>
-                </div>
+                <div class="status-line"><span class="status-dot" id="e2eDot"></span>E2E <strong id="e2eStatus" class="ms-auto">checking…</strong></div>
+                <div class="status-line"><span class="status-dot" id="keyDot"></span>Key <strong id="keyStatus" class="ms-auto">locked</strong></div>
+                <div class="status-line"><span class="status-dot" id="liveDot"></span>Live <strong id="liveStatus" class="ms-auto">polling</strong></div>
+                <button id="backupKeyButton" class="btn btn-outline-secondary btn-sm w-100 mt-1">
+                    <i class="fas fa-download"></i> Backup my key
+                </button>
+                <small class="text-muted d-block mt-2">Needed to read messages on another device.</small>
             </div>
         </div>
     </div>
@@ -48,15 +39,15 @@
         <div class="card shadow">
             <div class="card-header bg-primary text-white d-flex justify-content-between align-items-center">
                 <h6><i class="fas fa-comments"></i> Direct Messages</h6>
-                <span class="badge bg-success">
-                    <i class="fas fa-circle"></i> Connected
+                <span class="badge bg-warning" id="connBadge">
+                    <i class="fas fa-circle"></i> <span id="connBadgeText">Polling</span>
                 </span>
             </div>
             <div class="card-body">
                 <!-- Direct Message Area -->
-                <div id="messageArea" class="border rounded p-3 mb-3" style="height: 300px; overflow-y: auto; background-color: #f8f9fa;">
-                    <div class="text-center text-muted">
-                        <i class="fas fa-lock"></i> Private encrypted conversations
+                <div id="messageArea" class="p-3 mb-3" style="overflow-y: auto;">
+                    <div class="pane-placeholder">
+                        <i class="fas fa-lock"></i> Private, end-to-end encrypted conversations
                     </div>
                 </div>
 
@@ -98,9 +89,9 @@
             </div>
             <div class="card-body">
                 <!-- Broadcast Messages Area -->
-                <div id="broadcastArea" class="border rounded p-3 mb-3" style="height: 300px; overflow-y: auto; background-color: #fff3cd;">
-                    <div class="text-center text-muted">
-                        <i class="fas fa-broadcast-tower"></i> Public announcements to all users
+                <div id="broadcastArea" class="p-3 mb-3" style="overflow-y: auto;">
+                    <div class="pane-placeholder">
+                        <i class="fas fa-broadcast-tower"></i> Public messages to everyone
                     </div>
                 </div>
 
@@ -152,406 +143,232 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="{{ url_for('static', filename='js/socket.io.min.js') }}"></script>
 <script>
-let currentUser = '{{ username }}';
+const currentUser = {{ username | tojson }};
+let privateKey = null;                 // unwrapped CryptoKey for this tab
+const pubKeys = {};                    // username -> public key (base64 SPKI)
+let lastId = 0;                        // highest message id seen
+const seen = new Set();                // de-dupe across poll + socket
+let socket = null;
 
-document.addEventListener('DOMContentLoaded', function() {
+document.addEventListener('DOMContentLoaded', init);
+
+async function init() {
+    privateKey = await SSCrypto.loadUnlocked(currentUser);
+    if (!privateKey) {
+        // Key isn't unlocked in this tab (e.g. opened chat directly). Re-login.
+        window.location.href = '/login';
+        return;
+    }
+    setStatus('e2e', 'active', 'ok');
+    setStatus('key', 'unlocked', 'ok');
+
     setupEventListeners();
-    loadUsers();
-    loadMessages();
-    
-    // Refresh messages every 5 seconds
-    setInterval(loadMessages, 5000);
-});
+    await loadUsers();
+    await loadMessages();
+    connectRealtime();
+    // Polling is the fallback if WebSockets are unavailable.
+    setInterval(loadMessages, 4000);
+    setInterval(loadUsers, 15000);
+}
 
 function setupEventListeners() {
-    const directMessageInput = document.getElementById('directMessageInput');
-    const sendDirectButton = document.getElementById('sendDirectButton');
-    const broadcastMessageInput = document.getElementById('broadcastMessageInput');
-    const sendBroadcastButton = document.getElementById('sendBroadcastButton');
-    const toggleEncryption = document.getElementById('toggleEncryption');
-
-    // Send direct message on Enter key
-    directMessageInput.addEventListener('keypress', function(e) {
-        if (e.key === 'Enter' && !e.shiftKey) {
-            e.preventDefault();
-            sendDirectMessage();
-        }
-    });
-
-    // Send direct message on button click
-    sendDirectButton.addEventListener('click', sendDirectMessage);
-
-    // Send broadcast message on Enter key
-    broadcastMessageInput.addEventListener('keypress', function(e) {
-        if (e.key === 'Enter' && !e.shiftKey) {
-            e.preventDefault();
-            sendBroadcastMessage();
-        }
-    });
-
-    // Send broadcast message on button click
-    sendBroadcastButton.addEventListener('click', sendBroadcastMessage);
-
-    // Toggle encryption info
-    toggleEncryption.addEventListener('click', function() {
-        const modal = new bootstrap.Modal(document.getElementById('encryptionModal'));
-        modal.show();
+    const directInput = document.getElementById('directMessageInput');
+    const broadcastInput = document.getElementById('broadcastMessageInput');
+    directInput.addEventListener('keypress', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendDirectMessage(); } });
+    broadcastInput.addEventListener('keypress', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendBroadcastMessage(); } });
+    document.getElementById('sendDirectButton').addEventListener('click', sendDirectMessage);
+    document.getElementById('sendBroadcastButton').addEventListener('click', sendBroadcastMessage);
+    document.getElementById('backupKeyButton').addEventListener('click', backupKey);
+    document.getElementById('toggleEncryption').addEventListener('click', () => {
+        new bootstrap.Modal(document.getElementById('encryptionModal')).show();
     });
 }
 
-function sendDirectMessage() {
-    const messageInput = document.getElementById('directMessageInput');
-    const recipientSelect = document.getElementById('recipientSelect');
-    const message = messageInput.value.trim();
+function connectRealtime() {
+    if (typeof io === 'undefined') return;
+    try {
+        socket = io({ transports: ['websocket', 'polling'] });
+        socket.on('connect', () => setStatus('live', 'live', 'ok'));
+        socket.on('disconnect', () => setStatus('live', 'polling', 'warn'));
+        socket.on('new_message', async (msg) => { await renderMessage(msg); });
+    } catch (e) { /* fall back to polling */ }
+}
 
-    if (!message) return;
-
-    const recipient = recipientSelect.value;
-    
-    if (!recipient) {
-        showNotification('Please select a recipient for direct message', 'warning');
-        return;
+function setStatus(id, text, level) {
+    document.getElementById(id + 'Status').textContent = text;
+    const dot = document.getElementById(id + 'Dot');
+    dot.className = 'status-dot status-dot--' + (level || 'warn');
+    if (id === 'live') {
+        // Keep the Direct Messages header badge honest about the connection.
+        const badge = document.getElementById('connBadge');
+        const badgeText = document.getElementById('connBadgeText');
+        if (badge && badgeText) {
+            const isLive = level === 'ok';
+            badge.className = 'badge ' + (isLive ? 'bg-success' : 'bg-warning');
+            badgeText.textContent = isLive ? 'Live' : 'Polling';
+        }
     }
-
-    // Send direct message to server
-    fetch('/api/send_message', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-            message: message,
-            recipient: recipient
-        })
-    })
-    .then(response => response.json())
-    .then(data => {
-        if (data.success) {
-            // Display own message
-            addDirectMessage(currentUser, message, 'own');
-            
-            // Clear input
-            messageInput.value = '';
-            
-            // Show success notification
-            showNotification('Direct message sent successfully', 'success');
-        } else {
-            showNotification(data.message, 'error');
-        }
-    })
-    .catch(error => {
-        showNotification('Error sending direct message', 'error');
-    });
 }
 
-function sendBroadcastMessage() {
-    const messageInput = document.getElementById('broadcastMessageInput');
-    const message = messageInput.value.trim();
-
-    if (!message) return;
-
-    // Send broadcast message to server (no recipient = broadcast)
-    fetch('/api/send_message', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-            message: message,
-            recipient: '' // Empty recipient = broadcast
-        })
-    })
-    .then(response => response.json())
-    .then(data => {
-        if (data.success) {
-            // Display own broadcast message
-            addBroadcastMessage(currentUser, message, 'own');
-            
-            // Clear input
-            messageInput.value = '';
-            
-            // Show success notification
-            showNotification('Broadcast message sent successfully', 'success');
-        } else {
-            showNotification(data.message, 'error');
-        }
-    })
-    .catch(error => {
-        showNotification('Error sending broadcast message', 'error');
-    });
-}
-
-function loadUsers() {
-    fetch('/api/users')
-        .then(response => response.json())
-        .then(data => {
-            if (data.success) {
-                updateUserList(data.users);
-            }
-        })
-        .catch(error => {
-            console.error('Error loading users:', error);
+async function loadUsers() {
+    try {
+        const data = await (await fetch('/api/users')).json();
+        if (!data.success) return;
+        const userList = document.getElementById('userList');
+        const recipientSelect = document.getElementById('recipientSelect');
+        const prev = recipientSelect.value;
+        userList.innerHTML = '';
+        recipientSelect.innerHTML = '<option value="">Select recipient...</option>';
+        data.users.forEach(u => {
+            pubKeys[u.username] = u.public_key;
+            if (u.username === currentUser) return;
+            const li = document.createElement('li');
+            li.className = 'list-group-item d-flex align-items-center';
+            li.innerHTML = '<i class="fas fa-circle text-success me-2"></i><small></small>';
+            li.querySelector('small').textContent = u.username;
+            userList.appendChild(li);
+            const opt = document.createElement('option');
+            opt.value = u.username;
+            opt.textContent = u.username;
+            recipientSelect.appendChild(opt);
         });
+        recipientSelect.value = prev;
+    } catch (e) { console.error('loadUsers', e); }
 }
 
-function loadMessages() {
-    fetch('/api/messages')
-        .then(response => response.json())
-        .then(data => {
-            if (data.success) {
-                displayMessages(data.messages);
-            }
-        })
-        .catch(error => {
-            console.error('Error loading messages:', error);
-        });
-    
-    // Also load broadcast messages
-    fetch('/api/broadcast_messages')
-        .then(response => response.json())
-        .then(data => {
-            if (data.success) {
-                displayBroadcastMessages(data.broadcast_messages);
-            }
-        })
-        .catch(error => {
-            console.error('Error loading broadcast messages:', error);
-        });
+async function sendDirectMessage() {
+    const input = document.getElementById('directMessageInput');
+    const recipient = document.getElementById('recipientSelect').value;
+    const text = input.value.trim();
+    if (!text) return;
+    if (!recipient) { showNotification('Select a recipient', 'warning'); return; }
+    if (!pubKeys[recipient]) { showNotification('No key for that user yet', 'warning'); return; }
+
+    // Encrypt once per recipient and once for ourselves (so we can read our own copy).
+    const recipients = {};
+    recipients[recipient] = await SSCrypto.encryptFor(pubKeys[recipient], text);
+    recipients[currentUser] = await SSCrypto.encryptFor(pubKeys[currentUser], text);
+    const ok = await postMessage('direct', recipients);
+    if (ok) input.value = '';
 }
 
-function isEncryptedBlob(text) {
-    // Heuristic: long, no spaces, mostly base64
-    return typeof text === 'string' && text.length > 100 && /^[A-Za-z0-9+/=]+$/.test(text) && text.indexOf(' ') === -1;
-}
-
-function displayMessages(messages) {
-    const messageArea = document.getElementById('messageArea');
-    messageArea.innerHTML = '';
-    if (messages.length === 0) {
-        messageArea.innerHTML = `
-            <div class="text-center text-muted">
-                <i class="fas fa-lock"></i> No direct messages yet. Start a private conversation!
-            </div>
-        `;
-        return;
+async function sendBroadcastMessage() {
+    const input = document.getElementById('broadcastMessageInput');
+    const text = input.value.trim();
+    if (!text) return;
+    const recipients = {};
+    for (const [username, pk] of Object.entries(pubKeys)) {
+        recipients[username] = await SSCrypto.encryptFor(pk, text);
     }
-    messages.reverse().forEach(msg => {
-        const messageDiv = document.createElement('div');
-        messageDiv.className = 'mb-2';
-        const isOwn = msg.sender === currentUser;
-        const bgClass = isOwn ? 'bg-primary text-white' : 'bg-light';
-        const alignClass = isOwn ? 'justify-content-end' : 'justify-content-start';
-        let displayText = msg.encrypted_message;
-        // Hide encrypted blob for sender
-        if (isOwn && isEncryptedBlob(displayText)) {
-            displayText = '<span class="text-muted">[Encrypted message hidden]</span>';
-        }
-        messageDiv.innerHTML = `
-            <div class="d-flex ${alignClass}">
-                <div class="${bgClass} border rounded p-2" style="max-width: 70%;">
-                    <small class="${isOwn ? 'text-white-50' : 'text-muted'}">
-                        <i class="fas fa-user"></i> ${msg.sender} (${formatTimestamp(msg.timestamp)})
-                    </small><br>
-                    <div>${displayText}</div>
-                </div>
-            </div>
-        `;
-        messageArea.appendChild(messageDiv);
-    });
-    messageArea.scrollTop = messageArea.scrollHeight;
+    const ok = await postMessage('broadcast', recipients);
+    if (ok) input.value = '';
 }
 
-function autoDecryptMessage(encryptedMessage, callback) {
-    fetch('/api/decrypt_message', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-            encrypted_message: encryptedMessage
-        })
-    })
-    .then(response => response.json())
-    .then(data => {
-        if (data.success) {
-            callback(data.decrypted_message);
-        } else {
-            // If decryption fails, show the original message or a placeholder
-            callback('🔒 Encrypted message');
-        }
-    })
-    .catch(error => {
-        // If there's an error, show a placeholder
-        callback('🔒 Encrypted message');
-    });
+async function postMessage(type, recipients) {
+    try {
+        const data = await (await fetch('/api/send_message', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ type, recipients })
+        })).json();
+        if (!data.success) { showNotification(data.message || 'Send failed', 'error'); return false; }
+        return true;
+    } catch (e) { showNotification('Error sending message', 'error'); return false; }
 }
 
-function decryptMessage(encryptedMessage) {
-    fetch('/api/decrypt_message', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-            encrypted_message: encryptedMessage
-        })
-    })
-    .then(response => response.json())
-    .then(data => {
-        if (data.success) {
-            let message = `Decrypted message: ${data.decrypted_message}`;
-            if (data.note) {
-                message += ` (${data.note})`;
-            }
-            showNotification(message, 'success');
-        } else {
-            showNotification(data.message, 'error');
-        }
-    })
-    .catch(error => {
-        showNotification('Error decrypting message', 'error');
-    });
+async function loadMessages() {
+    try {
+        const data = await (await fetch('/api/messages?since=' + lastId)).json();
+        if (!data.success) return;
+        for (const msg of data.messages) await renderMessage(msg);
+    } catch (e) { console.error('loadMessages', e); }
 }
 
-function displayBroadcastMessages(broadcastMessages) {
-    const broadcastArea = document.getElementById('broadcastArea');
-    if (!broadcastArea) return;
-    broadcastArea.innerHTML = '';
-    if (broadcastMessages.length === 0) {
-        broadcastArea.innerHTML = `
-            <div class="text-center text-muted">
-                <i class="fas fa-broadcast-tower"></i> No broadcast messages yet.
-            </div>
-        `;
-        return;
+async function renderMessage(msg) {
+    if (msg.id) {
+        if (seen.has(msg.id)) return;
+        seen.add(msg.id);
+        if (msg.id > lastId) lastId = msg.id;
     }
-    broadcastMessages.reverse().forEach(msg => {
-        const messageDiv = document.createElement('div');
-        messageDiv.className = 'mb-2';
-        const isOwn = msg.sender === currentUser;
-        const bgClass = isOwn ? 'bg-warning text-dark' : 'bg-info text-white';
-        const alignClass = isOwn ? 'justify-content-end' : 'justify-content-start';
-        let displayText = msg.message;
-        if (isOwn && isEncryptedBlob(displayText)) {
-            displayText = '<span class="text-muted">[Encrypted message hidden]</span>';
-        }
-        messageDiv.innerHTML = `
-            <div class="d-flex ${alignClass}">
-                <div class="${bgClass} border rounded p-2" style="max-width: 70%;">
-                    <small class="${isOwn ? 'text-dark' : 'text-white-50'}">
-                        <i class="fas fa-broadcast-tower"></i> ${msg.sender} (${formatTimestamp(msg.timestamp)})
-                    </small><br>
-                    <div>${displayText}</div>
-                    <small class="${isOwn ? 'text-dark' : 'text-white-50'}">
-                        <i class="fas fa-users"></i> Sent to all users
-                    </small>
-                </div>
-            </div>
-        `;
-        broadcastArea.appendChild(messageDiv);
-    });
-    broadcastArea.scrollTop = broadcastArea.scrollHeight;
+    let text;
+    try {
+        text = await SSCrypto.decrypt(privateKey, msg.ciphertext);
+    } catch (e) {
+        text = '🔒 [unable to decrypt]';
+    }
+    const area = msg.msg_type === 'broadcast'
+        ? document.getElementById('broadcastArea')
+        : document.getElementById('messageArea');
+    clearPlaceholder(area);
+    appendBubble(area, msg.sender, text, msg.sender === currentUser, msg.msg_type === 'broadcast', msg.created_at);
 }
 
-function updateUserList(users) {
-    const userList = document.getElementById('userList');
-    const recipientSelect = document.getElementById('recipientSelect');
-    
-    // Clear current lists
-    userList.innerHTML = '';
-    recipientSelect.innerHTML = '<option value="">Select recipient...</option>';
-    
-    // Add users to both lists
-    users.forEach(user => {
-        if (user !== currentUser) {
-            // Add to user list
-            const userItem = document.createElement('li');
-            userItem.className = 'list-group-item d-flex align-items-center';
-            userItem.innerHTML = `
-                <i class="fas fa-circle text-success me-2"></i>
-                <small>${user}</small>
-            `;
-            userList.appendChild(userItem);
-            
-            // Add to recipient select
-            const option = document.createElement('option');
-            option.value = user;
-            option.textContent = user;
-            recipientSelect.appendChild(option);
-        }
-    });
+function clearPlaceholder(area) {
+    const ph = area.querySelector('.pane-placeholder');
+    if (ph) ph.remove();
 }
 
-function addDirectMessage(sender, message, type = 'other') {
-    const messageArea = document.getElementById('messageArea');
-    const messageDiv = document.createElement('div');
-    messageDiv.className = 'mb-2';
-    
-    const bgClass = type === 'own' ? 'bg-primary text-white' : 'bg-light';
-    const alignClass = type === 'own' ? 'justify-content-end' : 'justify-content-start';
-    
-    messageDiv.innerHTML = `
-        <div class="d-flex ${alignClass}">
-            <div class="${bgClass} border rounded p-2" style="max-width: 70%;">
-                <small class="${type === 'own' ? 'text-white-50' : 'text-muted'}">
-                    <i class="fas fa-user"></i> ${sender} (${new Date().toLocaleTimeString()})
-                </small><br>
-                <div>${message}</div>
-            </div>
-        </div>
-    `;
-    messageArea.appendChild(messageDiv);
-    messageArea.scrollTop = messageArea.scrollHeight;
+function appendBubble(area, sender, text, isOwn, isBroadcast, timestamp) {
+    const row = document.createElement('div');
+    row.className = 'msg-row' + (isOwn ? ' msg-row--own' : '');
+
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble ' + (isOwn ? 'bubble--own' : 'bubble--in')
+        + (isBroadcast ? ' bubble--broadcast' : '');
+
+    const meta = document.createElement('span');
+    meta.className = 'bubble-meta';
+    meta.textContent = (isOwn ? 'You' : sender) + ' · ' + formatTimestamp(timestamp);
+    const body = document.createElement('div');
+    body.textContent = text;                       // textContent => no HTML injection
+
+    bubble.appendChild(meta);
+    bubble.appendChild(body);
+    if (isBroadcast) {
+        const foot = document.createElement('span');
+        foot.className = 'bubble-foot';
+        foot.innerHTML = '<i class="fas fa-users"></i> Everyone';
+        bubble.appendChild(foot);
+    }
+    row.appendChild(bubble);
+    area.appendChild(row);
+    area.scrollTop = area.scrollHeight;
 }
 
-function addBroadcastMessage(sender, message, type = 'other') {
-    const broadcastArea = document.getElementById('broadcastArea');
-    const messageDiv = document.createElement('div');
-    messageDiv.className = 'mb-2';
-    
-    const bgClass = type === 'own' ? 'bg-warning text-dark' : 'bg-info text-white';
-    const alignClass = type === 'own' ? 'justify-content-end' : 'justify-content-start';
-    
-    messageDiv.innerHTML = `
-        <div class="d-flex ${alignClass}">
-            <div class="${bgClass} border rounded p-2" style="max-width: 70%;">
-                <small class="${type === 'own' ? 'text-dark' : 'text-white-50'}">
-                    <i class="fas fa-broadcast-tower"></i> ${sender} (${new Date().toLocaleTimeString()})
-                </small><br>
-                <div>${message}</div>
-                <small class="${type === 'own' ? 'text-dark' : 'text-white-50'}">
-                    <i class="fas fa-users"></i> Broadcast to all users
-                </small>
-            </div>
-        </div>
-    `;
-    broadcastArea.appendChild(messageDiv);
-    broadcastArea.scrollTop = broadcastArea.scrollHeight;
+function backupKey() {
+    const blob = SSCrypto.loadWrapped(currentUser);
+    if (!blob) { showNotification('No local key to back up', 'warning'); return; }
+    const file = new Blob([JSON.stringify(blob, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(file);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'socketstream-key-' + currentUser + '.json';
+    a.click();
+    URL.revokeObjectURL(url);
+    showNotification('Key backup downloaded. Keep it safe — it is encrypted with your password.', 'success');
 }
 
 function formatTimestamp(timestamp) {
-    const date = new Date(timestamp);
-    return date.toLocaleTimeString();
+    if (!timestamp) return new Date().toLocaleTimeString();
+    const d = new Date(timestamp.endsWith && timestamp.endsWith('Z') === false && timestamp.includes(' ') ? timestamp + 'Z' : timestamp);
+    return isNaN(d) ? '' : d.toLocaleTimeString();
 }
 
 function showNotification(message, type = 'info') {
-    const notification = document.createElement('div');
-    notification.className = `alert alert-${type} alert-dismissible fade show position-fixed`;
-    notification.style.cssText = 'top: 20px; right: 20px; z-index: 9999; min-width: 300px;';
-    notification.innerHTML = `
-        ${message}
-        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-    `;
-    
-    document.body.appendChild(notification);
-    
-    // Auto-remove after 5 seconds
-    setTimeout(() => {
-        if (notification.parentNode) {
-            notification.remove();
-        }
-    }, 5000);
+    const map = { error: 'danger' };
+    const n = document.createElement('div');
+    n.className = 'alert alert-' + (map[type] || type) + ' alert-dismissible fade show position-fixed';
+    n.style.cssText = 'top: 20px; right: 20px; z-index: 9999; min-width: 300px;';
+    n.textContent = message;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn-close';
+    btn.setAttribute('data-bs-dismiss', 'alert');
+    n.appendChild(btn);
+    document.body.appendChild(n);
+    setTimeout(() => { if (n.parentNode) n.remove(); }, 5000);
 }
 </script>
-{% endblock %} 
+{% endblock %}

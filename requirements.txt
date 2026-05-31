@@ -1,7 +1,10 @@
-Flask==2.3.3
-Flask-SocketIO==5.3.6
-cryptography==41.0.7
-pyOpenSSL==23.3.0
-bcrypt==4.0.1
-python-socketio==5.9.0
-eventlet==0.33.3 
+# Core
+Flask>=3.0,<4.0
+bcrypt>=4.1
+cryptography>=42.0        # used only by generate_certificates.py (TLS cert)
+
+# Optional real-time delivery. Without it the app falls back to HTTP polling.
+flask-socketio>=5.3
+
+# Tests
+pytest>=8.0

@@ -3,7 +3,7 @@
 {% block title %}Register - SocketStream{% endblock %}
 
 {% block content %}
-<div class="row justify-content-center">
+<div class="row justify-content-center align-items-center auth-shell">
     <div class="col-md-6 col-lg-4">
         <div class="card shadow">
             <div class="card-header bg-success text-white text-center">
@@ -80,50 +80,56 @@ document.addEventListener('DOMContentLoaded', function() {
     });
 
     // Handle form submission
-    registerForm.addEventListener('submit', function(e) {
+    registerForm.addEventListener('submit', async function(e) {
         e.preventDefault();
-        
-        const username = document.getElementById('username').value;
+
+        const username = document.getElementById('username').value.trim();
         const password = document.getElementById('password').value;
         const confirmPassword = document.getElementById('confirmPassword').value;
 
-        // Validation
+        if (!/^[A-Za-z0-9_]{3,32}$/.test(username)) {
+            showAlert('warning', 'Username must be 3-32 characters: letters, digits, underscore');
+            return;
+        }
         if (password.length < 8) {
             showAlert('warning', 'Password must be at least 8 characters long');
             return;
         }
-
         if (password !== confirmPassword) {
             showAlert('warning', 'Passwords do not match');
             return;
         }
 
-        const formData = {
-            username: username,
-            password: password
-        };
+        const submitBtn = registerForm.querySelector('button[type="submit"]');
+        submitBtn.disabled = true;
+        showAlert('info', 'Generating your encryption keys in this browser...');
 
-        fetch('/register', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(formData)
-        })
-        .then(response => response.json())
-        .then(data => {
+        try {
+            // Keys are generated here and never leave the device unencrypted.
+            const identity = await SSCrypto.generateIdentity();
+            const wrapped = await SSCrypto.wrapPrivateKey(identity.privateKey, password);
+
+            const res = await fetch('/register', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, password, public_key: identity.publicKeyB64 })
+            });
+            const data = await res.json();
+
             if (data.success) {
-                showAlert('success', data.message);
-                setTimeout(() => {
-                    window.location.href = '/chat';
-                }, 1000);
+                // Persist the password-wrapped key locally; unlock it for this tab.
+                SSCrypto.storeWrapped(username, wrapped);
+                await SSCrypto.cacheUnlocked(username, identity.privateKey);
+                showAlert('success', 'Account created. Redirecting...');
+                setTimeout(() => { window.location.href = '/chat'; }, 800);
             } else {
-                showAlert('danger', data.message);
+                showAlert('danger', data.message || 'Registration failed');
+                submitBtn.disabled = false;
             }
-        })
-        .catch(error => {
-            showAlert('danger', 'An error occurred. Please try again.');
-        });
+        } catch (err) {
+            showAlert('danger', 'Key generation failed: ' + err.message);
+            submitBtn.disabled = false;
+        }
     });
 
     function showAlert(type, message) {

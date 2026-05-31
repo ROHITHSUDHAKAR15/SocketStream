@@ -1,503 +1,390 @@
+"""
+SocketStream - end-to-end encrypted chat.
+
+The server is a zero-knowledge relay: it stores public keys and ciphertext only.
+All key generation, encryption, and decryption happen in the browser (WebCrypto).
+The server never sees a private key or a plaintext message - see SECURITY.md.
+"""
 import os
-import json
-import base64
-import hashlib
-import threading
+import re
+import time
+import secrets
 import sqlite3
-from datetime import datetime
-from flask import Flask, render_template, request, jsonify, session, redirect, url_for
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.backends import default_backend
+import threading
+from datetime import datetime, timezone
+from functools import wraps
+
 import bcrypt
-import ssl
+from flask import (
+    Flask, render_template, request, jsonify, session, redirect, url_for
+)
+
+# Optional real-time layer. The app works without it (clients fall back to polling).
+try:
+    from flask_socketio import SocketIO, join_room, disconnect
+    _HAS_SOCKETIO = True
+except Exception:  # pragma: no cover - optional dependency
+    _HAS_SOCKETIO = False
+
+DB_PATH = os.environ.get("SS_DB", "secure_messaging.db")
+SECRET_FILE = os.environ.get("SS_SECRET_FILE", ".flask_secret")
+
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,32}$")
+MIN_PASSWORD_LEN = 8
+MAX_PUBKEY_LEN = 4000          # base64 SPKI of an RSA-2048 key is ~600 bytes
+MAX_CIPHERTEXT_LEN = 100_000   # bounds a hybrid-encrypted message blob
+MAX_RECIPIENTS = 500
+LOGIN_MAX_ATTEMPTS = 10
+LOGIN_WINDOW_SECONDS = 300
+
+db_lock = threading.Lock()
+_login_attempts = {}  # ip -> list[timestamp]
+_attempts_lock = threading.Lock()
+
+
+def _load_secret_key() -> bytes:
+    """Persist the session secret so restarts don't invalidate every session."""
+    env = os.environ.get("SS_SECRET_KEY")
+    if env:
+        return env.encode()
+    try:
+        with open(SECRET_FILE, "rb") as f:
+            data = f.read().strip()
+            if data:
+                return data
+    except FileNotFoundError:
+        pass
+    key = secrets.token_hex(32).encode()
+    try:
+        with open(SECRET_FILE, "wb") as f:
+            f.write(key)
+        os.chmod(SECRET_FILE, 0o600)
+    except OSError:
+        pass  # fall back to an ephemeral key if the file isn't writable
+    return key
+
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.urandom(24)
+app.config.update(
+    SECRET_KEY=_load_secret_key(),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("SS_COOKIE_SECURE", "1") == "1",
+    JSON_SORT_KEYS=False,
+)
 
-# Global variables
-connected_users = {}
-user_keys = {}
-message_history = []
-broadcast_messages = []
-db_lock = threading.Lock()
+socketio = SocketIO(app, cors_allowed_origins=[], async_mode="threading") if _HAS_SOCKETIO else None
 
-# Initialize database
-def init_database():
-    with db_lock:
-        conn = sqlite3.connect('secure_messaging.db')
-        cursor = conn.cursor()
-        cursor.execute('''
+
+# --------------------------------------------------------------------------- #
+# Database
+# --------------------------------------------------------------------------- #
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_database() -> None:
+    with db_lock, get_db() as conn:
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                username      TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
-                public_key TEXT,
-                private_key TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                public_key    TEXT NOT NULL,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        ''')
-        cursor.execute('''
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sender TEXT NOT NULL,
-                recipient TEXT,
-                encrypted_message TEXT NOT NULL,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender      TEXT NOT NULL,
+                recipient   TEXT NOT NULL,
+                ciphertext  TEXT NOT NULL,
+                msg_type    TEXT NOT NULL DEFAULT 'direct',
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        ''')
-        conn.commit()
-        conn.close()
-
-# Encryption utilities
-def generate_key_pair():
-    """Generate RSA key pair for user"""
-    private_key = rsa.generate_private_key(
-        public_exponent=65537,
-        key_size=2048,
-        backend=default_backend()
-    )
-    public_key = private_key.public_key()
-    
-    # Serialize keys
-    private_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption()
-    )
-    public_pem = public_key.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo
-    )
-    
-    return private_pem.decode(), public_pem.decode()
-
-def encrypt_message(message, public_key_pem):
-    """Encrypt message using recipient's public key"""
-    try:
-        public_key = serialization.load_pem_public_key(
-            public_key_pem.encode(),
-            backend=default_backend()
+            """
         )
-        
-        # Generate a random AES key for message encryption
-        aes_key = os.urandom(32)
-        iv = os.urandom(16)
-        
-        # Encrypt the message with AES
-        cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
-        encryptor = cipher.encryptor()
-        
-        # Pad the message to be a multiple of 16 bytes
-        padded_message = message.encode()
-        padding_length = 16 - (len(padded_message) % 16)
-        padded_message += bytes([padding_length] * padding_length)
-        
-        encrypted_message = encryptor.update(padded_message) + encryptor.finalize()
-        
-        # Encrypt the AES key with RSA
-        encrypted_key = public_key.encrypt(
-            aes_key,
-            padding.OAEP(
-                mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient, id)"
+        )
+
+
+def get_user(username: str):
+    with db_lock, get_db() as conn:
+        return conn.execute(
+            "SELECT * FROM users WHERE username = ?", (username,)
+        ).fetchone()
+
+
+def create_user(username: str, password_hash: str, public_key: str) -> bool:
+    with db_lock, get_db() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO users (username, password_hash, public_key) VALUES (?, ?, ?)",
+                (username, password_hash, public_key),
             )
-        )
-        
-        # Combine encrypted key, IV, and encrypted message
-        combined = encrypted_key + iv + encrypted_message
-        return base64.b64encode(combined).decode()
-    except Exception as e:
-        print(f"Encryption error: {e}")
-        return None
+            return True
+        except sqlite3.IntegrityError:
+            return False
 
-def decrypt_message(encrypted_data, private_key_pem):
-    """Decrypt message using user's private key"""
-    try:
-        private_key = serialization.load_pem_private_key(
-            private_key_pem.encode(),
-            password=None,
-            backend=default_backend()
-        )
-        
-        # Decode the combined data
-        combined = base64.b64decode(encrypted_data)
-        
-        # Extract encrypted key, IV, and encrypted message
-        encrypted_key = combined[:256]  # RSA encrypted key
-        iv = combined[256:272]  # 16 bytes IV
-        encrypted_message = combined[272:]  # AES encrypted message
-        
-        # Decrypt the AES key
-        aes_key = private_key.decrypt(
-            encrypted_key,
-            padding.OAEP(
-                mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None
-            )
-        )
-        
-        # Decrypt the message
-        cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
-        decryptor = cipher.decryptor()
-        decrypted_padded = decryptor.update(encrypted_message) + decryptor.finalize()
-        
-        # Remove padding
-        padding_length = decrypted_padded[-1]
-        decrypted_message = decrypted_padded[:-padding_length]
-        
-        return decrypted_message.decode()
-    except Exception as e:
-        print(f"Decryption error: {e}")
-        return None
 
-# Database operations
-def save_user(username, password_hash, public_key, private_key=None):
-    """Save user to database"""
-    with db_lock:
-        conn = sqlite3.connect('secure_messaging.db')
-        cursor = conn.cursor()
-        cursor.execute(
-            'INSERT OR REPLACE INTO users (username, password_hash, public_key, private_key) VALUES (?, ?, ?, ?)',
-            (username, password_hash, public_key, private_key)
-        )
-        conn.commit()
-        conn.close()
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if "username" not in session:
+            return jsonify({"success": False, "message": "Not authenticated"}), 401
+        return view(*args, **kwargs)
 
-def get_user(username):
-    """Get user from database"""
-    with db_lock:
-        conn = sqlite3.connect('secure_messaging.db')
-        cursor = conn.cursor()
-        cursor.execute('SELECT * FROM users WHERE username = ?', (username,))
-        user = cursor.fetchone()
-        conn.close()
-        return user
+    return wrapped
 
-def save_message(sender, recipient, encrypted_message, message_type='broadcast'):
-    """Save encrypted message to database"""
-    with db_lock:
-        conn = sqlite3.connect('secure_messaging.db')
-        cursor = conn.cursor()
-        cursor.execute(
-            'INSERT INTO messages (sender, recipient, encrypted_message) VALUES (?, ?, ?)',
-            (sender, recipient, encrypted_message)
-        )
-        conn.commit()
-        conn.close()
 
-# Flask routes
-@app.route('/')
+def _rate_limited(key: str) -> bool:
+    now = time.time()
+    with _attempts_lock:
+        hits = [t for t in _login_attempts.get(key, []) if now - t < LOGIN_WINDOW_SECONDS]
+        _login_attempts[key] = hits
+        return len(hits) >= LOGIN_MAX_ATTEMPTS
+
+
+def _record_attempt(key: str) -> None:
+    with _attempts_lock:
+        _login_attempts.setdefault(key, []).append(time.time())
+
+
+def _valid_pubkey(pk) -> bool:
+    return isinstance(pk, str) and 0 < len(pk) <= MAX_PUBKEY_LEN
+
+
+def _valid_ciphertext(ct) -> bool:
+    return isinstance(ct, str) and 0 < len(ct) <= MAX_CIPHERTEXT_LEN
+
+
+# --------------------------------------------------------------------------- #
+# Page routes
+# --------------------------------------------------------------------------- #
+@app.route("/")
 def index():
-    if 'username' in session:
-        return redirect(url_for('chat'))
-    return render_template('login.html')
+    if "username" in session:
+        return redirect(url_for("chat"))
+    return render_template("login.html")
 
-@app.route('/register', methods=['GET', 'POST'])
+
+@app.route("/register", methods=["GET", "POST"])
 def register():
-    if request.method == 'POST':
-        data = request.get_json()
-        username = data.get('username')
-        password = data.get('password')
-        
-        if not username or not password:
-            return jsonify({'success': False, 'message': 'Username and password required'})
-        
-        # Check if user already exists
-        existing_user = get_user(username)
-        if existing_user:
-            return jsonify({'success': False, 'message': 'Username already exists'})
-        
-        # Generate key pair
-        private_key, public_key = generate_key_pair()
-        
-        # Hash password with bcrypt
-        password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-        
-        # Save user with private key (NOT secure for production!)
-        save_user(username, password_hash, public_key, private_key)
-        
-        # Store private key in session
-        session['private_key'] = private_key
-        session['username'] = username
-        
-        return jsonify({'success': True, 'message': 'Registration successful'})
-    
-    return render_template('register.html')
+    if request.method == "GET":
+        return render_template("register.html")
 
-@app.route('/login', methods=['GET', 'POST'])
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    public_key = data.get("public_key") or ""
+
+    if not USERNAME_RE.match(username):
+        return jsonify({"success": False, "message": "Username must be 3-32 chars: letters, digits, underscore"}), 400
+    if len(password) < MIN_PASSWORD_LEN:
+        return jsonify({"success": False, "message": f"Password must be at least {MIN_PASSWORD_LEN} characters"}), 400
+    if not _valid_pubkey(public_key):
+        return jsonify({"success": False, "message": "Missing or invalid public key"}), 400
+
+    password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    if not create_user(username, password_hash, public_key):
+        return jsonify({"success": False, "message": "Username already exists"}), 409
+
+    session["username"] = username
+    return jsonify({"success": True, "message": "Registration successful"})
+
+
+@app.route("/login", methods=["GET", "POST"])
 def login():
-    if request.method == 'POST':
-        data = request.get_json()
-        username = data.get('username')
-        password = data.get('password')
-        
-        if not username or not password:
-            return jsonify({'success': False, 'message': 'Username and password required'})
-        
-        # Get user from database
-        user = get_user(username)
-        if not user:
-            return jsonify({'success': False, 'message': 'User not found'})
-        
-        # Verify password
-        if bcrypt.checkpw(password.encode(), user[2].encode()):
-            session['username'] = username
-            session['private_key'] = user[4]  # Private key is now at index 4
-            return jsonify({'success': True, 'message': 'Login successful'})
-        else:
-            return jsonify({'success': False, 'message': 'Invalid password'})
-    
-    return render_template('login.html')
+    if request.method == "GET":
+        return render_template("login.html")
 
-@app.route('/chat')
+    ip = request.remote_addr or "unknown"
+    if _rate_limited(ip):
+        return jsonify({"success": False, "message": "Too many attempts, try again later"}), 429
+
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+
+    user = get_user(username)
+    if not user or not bcrypt.checkpw(password.encode(), user["password_hash"].encode()):
+        _record_attempt(ip)
+        return jsonify({"success": False, "message": "Invalid username or password"}), 401
+
+    session["username"] = username
+    return jsonify({"success": True, "message": "Login successful"})
+
+
+@app.route("/chat")
 def chat():
-    if 'username' not in session:
-        return redirect(url_for('login'))
-    return render_template('simple_chat.html', username=session['username'])
+    if "username" not in session:
+        return redirect(url_for("login"))
+    return render_template("simple_chat.html", username=session["username"])
 
-@app.route('/logout')
+
+@app.route("/logout")
 def logout():
     session.clear()
-    return redirect(url_for('login'))
+    return redirect(url_for("login"))
 
-@app.route('/api/send_message', methods=['POST'])
-def send_message():
-    if 'username' not in session:
-        return jsonify({'success': False, 'message': 'Not authenticated'})
-    
-    data = request.get_json()
-    message = data.get('message', '').strip()
-    recipient = data.get('recipient')
-    
-    if not message:
-        return jsonify({'success': False, 'message': 'Message cannot be empty'})
-    
-    sender = session['username']
-    
-    # For broadcast messages (no recipient specified)
-    if not recipient or recipient == '':
-        # Create a broadcast message that all users can decrypt
-        try:
-            # Get all users to encrypt for each one
-            with db_lock:
-                conn = sqlite3.connect('secure_messaging.db')
-                cursor = conn.cursor()
-                cursor.execute('SELECT username, public_key FROM users')
-                users = cursor.fetchall()
-                conn.close()
-            
-            # Encrypt message for each user
-            encrypted_messages = {}
-            for username, public_key in users:
-                if public_key:
-                    encrypted = encrypt_message(message, public_key)
-                    if encrypted:
-                        encrypted_messages[username] = encrypted
-            
-            # Save the message for each user
-            for username, encrypted_msg in encrypted_messages.items():
-                save_message(sender, username, encrypted_msg, 'broadcast')
-            
-            # Also save a plain text version for the sender
-            save_message(sender, sender, message, 'broadcast')
-            
-            # Add to broadcast history
-            broadcast_messages.append({
-                'sender': sender,
-                'message': message,
-                'timestamp': datetime.now().isoformat(),
-                'encrypted_for': list(encrypted_messages.keys())
-            })
-            
-            return jsonify({
-                'success': True, 
-                'message': f'Broadcast message sent to {len(encrypted_messages)} users',
-                'encrypted': True,
-                'recipients': len(encrypted_messages)
-            })
-            
-        except Exception as e:
-            print(f"Broadcast encryption error: {e}")
-            # Fallback to plain text broadcast
-            save_message(sender, None, message, 'broadcast')
-            broadcast_messages.append({
-                'sender': sender,
-                'message': message,
-                'timestamp': datetime.now().isoformat(),
-                'encrypted_for': []
-            })
-            return jsonify({
-                'success': True, 
-                'message': 'Broadcast message sent (not encrypted)',
-                'encrypted': False
-            })
-    
-    else:
-        # Direct message to specific recipient
-        try:
-            # Get recipient's public key
-            recipient_user = get_user(recipient)
-            if not recipient_user or not recipient_user[3]:  # public_key
-                return jsonify({'success': False, 'message': 'Recipient not found or no public key'})
-            
-            encrypted_message = encrypt_message(message, recipient_user[3])
-            if encrypted_message:
-                save_message(sender, recipient, encrypted_message, 'direct')
-                # Save plain text for sender
-                save_message(sender, sender, message, 'direct')
-                return jsonify({
-                    'success': True, 
-                    'message': 'Direct message sent successfully',
-                    'encrypted': True
-                })
-            else:
-                save_message(sender, recipient, message, 'direct')
-                save_message(sender, sender, message, 'direct')
-                return jsonify({
-                    'success': True, 
-                    'message': 'Direct message sent (not encrypted)',
-                    'encrypted': False
-                })
-        except Exception as e:
-            print(f"Direct message encryption error: {e}")
-            save_message(sender, recipient, message, 'direct')
-            save_message(sender, sender, message, 'direct')
-            return jsonify({
-                'success': True, 
-                'message': 'Direct message sent (not encrypted)',
-                'encrypted': False
-            })
 
-@app.route('/api/decrypt_message', methods=['POST'])
-def decrypt_message_api():
-    if 'username' not in session:
-        return jsonify({'success': False, 'message': 'Not authenticated'})
-    
-    data = request.get_json()
-    encrypted_message = data.get('encrypted_message')
-    
-    if not encrypted_message or 'private_key' not in session:
-        return jsonify({'success': False, 'message': 'Invalid request'})
-    
-    try:
-        # Check if the message is actually encrypted (base64 format)
-        if len(encrypted_message) > 100 and encrypted_message.startswith('-----BEGIN PUBLIC KEY-----'):
-            # This is a public key, not an encrypted message
-            return jsonify({'success': False, 'message': 'Message is not encrypted'})
-        
-        # Try to decrypt
-        decrypted_message = decrypt_message(encrypted_message, session['private_key'])
-        if decrypted_message:
-            return jsonify({
-                'success': True,
-                'decrypted_message': decrypted_message
-            })
-        else:
-            # If decryption fails, the message might be plain text
-            return jsonify({
-                'success': True,
-                'decrypted_message': encrypted_message,
-                'note': 'Message was not encrypted'
-            })
-    except Exception as e:
-        print(f"Decryption error: {e}")
-        # If decryption fails, return the original message
-        return jsonify({
-            'success': True,
-            'decrypted_message': encrypted_message,
-            'note': 'Decryption failed, showing original message'
-        })
+# --------------------------------------------------------------------------- #
+# API
+# --------------------------------------------------------------------------- #
+@app.route("/api/health")
+def health():
+    return jsonify({"status": "ok", "realtime": bool(socketio)})
 
-@app.route('/api/users')
+
+@app.route("/api/me")
+@login_required
+def me():
+    user = get_user(session["username"])
+    return jsonify({"success": True, "username": session["username"],
+                    "public_key": user["public_key"] if user else None})
+
+
+@app.route("/api/users")
+@login_required
 def get_users():
-    if 'username' not in session:
-        return jsonify({'success': False, 'message': 'Not authenticated'})
-    
-    with db_lock:
-        conn = sqlite3.connect('secure_messaging.db')
-        cursor = conn.cursor()
-        cursor.execute('SELECT username FROM users WHERE username != ?', (session['username'],))
-        users = [row[0] for row in cursor.fetchall()]
-        conn.close()
-    
-    return jsonify({'success': True, 'users': users})
+    with db_lock, get_db() as conn:
+        rows = conn.execute("SELECT username, public_key FROM users ORDER BY username").fetchall()
+    users = [{"username": r["username"], "public_key": r["public_key"]} for r in rows]
+    return jsonify({"success": True, "users": users})
 
-@app.route('/api/messages')
+
+@app.route("/api/send_message", methods=["POST"])
+@login_required
+def send_message():
+    data = request.get_json(silent=True) or {}
+    msg_type = data.get("type", "direct")
+    recipients = data.get("recipients")  # {username: ciphertext} including a self-copy
+
+    if msg_type not in ("direct", "broadcast"):
+        return jsonify({"success": False, "message": "Invalid message type"}), 400
+    if not isinstance(recipients, dict) or not recipients:
+        return jsonify({"success": False, "message": "No recipients"}), 400
+    if len(recipients) > MAX_RECIPIENTS:
+        return jsonify({"success": False, "message": "Too many recipients"}), 400
+
+    sender = session["username"]
+    delivered = []  # (id, recipient, ciphertext) for real-time push
+    with db_lock, get_db() as conn:
+        known = {r["username"] for r in conn.execute("SELECT username FROM users").fetchall()}
+        for recipient, ciphertext in recipients.items():
+            if recipient not in known:
+                return jsonify({"success": False, "message": f"Unknown recipient: {recipient}"}), 400
+            if not _valid_ciphertext(ciphertext):
+                return jsonify({"success": False, "message": "Invalid ciphertext"}), 400
+        # Insert one row per recipient, capturing each row id so the real-time
+        # event can carry it — the client dedups on id across socket + polling.
+        for recipient, ciphertext in recipients.items():
+            cur = conn.execute(
+                "INSERT INTO messages (sender, recipient, ciphertext, msg_type) VALUES (?, ?, ?, ?)",
+                (sender, recipient, ciphertext, msg_type),
+            )
+            delivered.append((cur.lastrowid, recipient, ciphertext))
+
+    # Push to connected recipients in real time (ciphertext only).
+    if socketio:
+        ts = datetime.now(timezone.utc).isoformat()
+        for msg_id, recipient, ciphertext in delivered:
+            socketio.emit(
+                "new_message",
+                {"id": msg_id, "sender": sender, "recipient": recipient,
+                 "ciphertext": ciphertext, "msg_type": msg_type, "created_at": ts},
+                room=recipient,
+            )
+
+    return jsonify({"success": True, "delivered": len(delivered)})
+
+
+@app.route("/api/messages")
+@login_required
 def get_messages():
-    if 'username' not in session:
-        return jsonify({'success': False, 'message': 'Not authenticated'})
-    
-    with db_lock:
-        conn = sqlite3.connect('secure_messaging.db')
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT sender, recipient, encrypted_message, timestamp 
-            FROM messages 
-            WHERE sender = ? OR recipient = ? OR recipient IS NULL
-            ORDER BY timestamp DESC LIMIT 50
-        ''', (session['username'], session['username']))
-        messages = []
-        for row in cursor.fetchall():
-            # Handle message display - always show readable content
-            message_content = row[2]  # encrypted_message field
-            
-            # If the sender is the current user, always show plain text
-            if row[0] == session['username']:
-                display_message = message_content
-            # Check if message is encrypted (long base64 string)
-            elif message_content and len(message_content) > 100 and not message_content.startswith('🔒'):
-                # Try to decrypt
-                try:
-                    decrypted = decrypt_message(message_content, session.get('private_key', ''))
-                    if decrypted:
-                        display_message = decrypted
-                    else:
-                        display_message = "🔒 Encrypted message"
-                except Exception as e:
-                    display_message = "🔒 Encrypted message"
-            else:
-                # Already readable or placeholder
-                display_message = message_content
-            
-            messages.append({
-                'sender': row[0],
-                'recipient': row[1],
-                'encrypted_message': display_message,  # Now contains displayable text
-                'timestamp': row[3]
-            })
-        conn.close()
-    
-    return jsonify({'success': True, 'messages': messages})
+    me_ = session["username"]
+    try:
+        since = int(request.args.get("since", 0))
+    except (TypeError, ValueError):
+        since = 0
 
-@app.route('/api/broadcast_messages')
-def get_broadcast_messages():
-    if 'username' not in session:
-        return jsonify({'success': False, 'message': 'Not authenticated'})
-    
-    # Return recent broadcast messages
-    recent_broadcasts = broadcast_messages[-20:]  # Last 20 broadcast messages
-    return jsonify({'success': True, 'broadcast_messages': recent_broadcasts})
+    with db_lock, get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, sender, recipient, ciphertext, msg_type, created_at
+            FROM messages
+            WHERE recipient = ? AND id > ?
+            ORDER BY id ASC
+            LIMIT 200
+            """,
+            (me_, since),
+        ).fetchall()
 
-if __name__ == '__main__':
+    messages = [dict(r) for r in rows]
+    return jsonify({"success": True, "messages": messages})
+
+
+# --------------------------------------------------------------------------- #
+# WebSocket events (optional)
+# --------------------------------------------------------------------------- #
+if socketio:
+
+    @socketio.on("connect")
+    def _on_connect():
+        username = session.get("username")
+        if not username:
+            disconnect()
+            return False
+        join_room(username)
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# Entrypoint
+# --------------------------------------------------------------------------- #
+def _ssl_context():
+    if os.environ.get("SS_TLS", "auto") == "off":
+        return None  # e.g. behind a TLS-terminating proxy, or local http testing
+    cert, key = "server.crt", "server.key"
+    if os.path.exists(cert) and os.path.exists(key):
+        return (cert, key)
+    print("WARNING: server.crt/server.key not found - run 'python generate_certificates.py'. "
+          "Starting WITHOUT TLS.")
+    return None
+
+
+def main():
     init_database()
-    
-    # SSL context for HTTPS
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.load_cert_chain('server.crt', 'server.key')
-    
-    print("Starting SocketStream Secure Messaging Server...")
-    print("Server will be available at: https://localhost:5000")
-    print("Features:")
-    print("- End-to-End Encryption with RSA-2048 and AES-256")
-    print("- SSL/TLS Security")
-    print("- Secure Authentication with bcrypt")
-    print("- SQLite Database Storage")
-    print("- Web-based Interface")
-    print("- Broadcast Messaging")
-    
-    # Run with SSL
-    app.run(host='0.0.0.0', port=5050, ssl_context=context, debug=True) 
+    host = os.environ.get("SS_HOST", "127.0.0.1")
+    port = int(os.environ.get("SS_PORT", "5000"))
+    debug = os.environ.get("SS_DEBUG", "0") == "1"
+    ctx = _ssl_context()
+    scheme = "https" if ctx else "http"
+
+    print("Starting SocketStream (end-to-end encrypted chat)")
+    print(f"  URL:       {scheme}://localhost:{port}")
+    print(f"  Real-time: {'WebSocket (Flask-SocketIO)' if socketio else 'polling (install flask-socketio for live)'}")
+    print(f"  TLS:       {'on' if ctx else 'OFF'}   Debug: {'on' if debug else 'off'}")
+
+    run_kwargs = dict(host=host, port=port, debug=debug)
+    if ctx:
+        run_kwargs["ssl_context"] = ctx
+    if socketio:
+        run_kwargs["allow_unsafe_werkzeug"] = True
+        socketio.run(app, **run_kwargs)
+    else:
+        app.run(**run_kwargs)
+
+
+if __name__ == "__main__":
+    main()

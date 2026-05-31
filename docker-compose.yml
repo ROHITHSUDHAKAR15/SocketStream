@@ -1,0 +1,20 @@
+services:
+  socketstream:
+    build: .
+    ports:
+      - "5000:5000"
+    environment:
+      SS_HOST: 0.0.0.0
+      SS_PORT: "5000"
+      SS_DEBUG: "0"
+      SS_COOKIE_SECURE: "1"
+    volumes:
+      # Persist the database and TLS material across restarts.
+      - ss-data:/app/data
+      - ./server.crt:/app/server.crt:ro
+      - ./server.key:/app/server.key:ro
+    # Point the DB at the named volume.
+    command: sh -c "mkdir -p data && SS_DB=data/secure_messaging.db python simple_secure_server.py"
+
+volumes:
+  ss-data:

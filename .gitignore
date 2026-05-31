@@ -113,4 +113,18 @@ cython_debug/
 
 # Environment variables
 .env
-.env.* 
+.env.*
+!.env.example
+
+# Flask session secret (auto-generated)
+.flask_secret
+
+# Virtualenvs
+venv/
+.venv/
+
+# Local data volume
+data/ 
+# Local preview / editor tooling
+.claude/
+preview.db
