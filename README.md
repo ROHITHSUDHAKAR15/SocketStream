@@ -105,7 +105,14 @@ limiting, per-recipient ciphertext relay, and the message cursor.
 ## Project structure
 
 ```
-simple_secure_server.py   Flask zero-knowledge relay (auth, public keys, ciphertext, realtime)
+simple_secure_server.py   Thin entrypoint — builds the app from env and runs it
+socketstream/             The relay, layered by concern:
+  config.py                 immutable runtime config (read once from the environment)
+  models.py                 domain entities (User, Message) + their wire shapes
+  storage.py                hand-written SQLite — Database + repositories, no ORM
+  security.py               input validation, login rate limiting, auth decorator
+  realtime.py               optional WebSocket delivery, degrading to polling
+  app.py                    application factory + route blueprint
 static/js/crypto.js       WebCrypto module (keygen, wrap/unwrap, encrypt/decrypt) — runs in browser
 static/js/socket.io.min.js Vendored Socket.IO client (no external CDN dependency)
 static/css/style.css      Themed UI (design tokens, light + dark)

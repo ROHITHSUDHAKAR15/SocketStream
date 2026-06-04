@@ -4,20 +4,20 @@ Tests for the SocketStream relay server.
 The server is meant to be zero-knowledge: it stores public keys and ciphertext
 only. These tests pin that contract down - in particular that there is no place
 for a private key or a plaintext message to land on the server.
+
+The app is built through its factory (`create_app`) against a throwaway database
+and an in-memory secret, so nothing here touches the developer's real state.
 """
+import importlib
 import os
+import pkgutil
 import sqlite3
 import tempfile
 
 import pytest
 
-# Configure the app for testing BEFORE importing it (config is read at import).
-_TMP = tempfile.mkdtemp()
-os.environ["SS_DB"] = os.path.join(_TMP, "test.db")
-os.environ["SS_SECRET_KEY"] = "test-secret-not-persisted"
-os.environ["SS_COOKIE_SECURE"] = "0"  # test client speaks http
-
-import simple_secure_server as srv  # noqa: E402
+import socketstream
+from socketstream import Config, create_app
 
 # A throwaway but well-formed-looking public key blob (server only bounds length).
 FAKE_PUBKEY = "AAAA" + "B" * 200
@@ -25,22 +25,31 @@ FAKE_CIPHERTEXT = "Q" * 400
 
 
 @pytest.fixture()
-def fresh_db():
-    if os.path.exists(srv.DB_PATH):
-        os.remove(srv.DB_PATH)
-    srv.init_database()
-    srv._login_attempts.clear()
-    yield
+def config():
+    db_path = os.path.join(tempfile.mkdtemp(), "test.db")
+    return Config(
+        db_path=db_path,
+        secret_key=b"test-secret-not-persisted",
+        cookie_secure=False,  # the test client speaks http
+    )
 
 
 @pytest.fixture()
-def client(fresh_db):
-    srv.app.config["TESTING"] = True
-    return srv.app.test_client()
+def app(config):
+    application = create_app(config)
+    application.config["TESTING"] = True
+    return application
+
+
+@pytest.fixture()
+def client(app):
+    return app.test_client()
 
 
 def register(client, username, password="Secret123!", pubkey=FAKE_PUBKEY):
-    return client.post("/register", json={"username": username, "password": password, "public_key": pubkey})
+    return client.post("/register", json={
+        "username": username, "password": password, "public_key": pubkey,
+    })
 
 
 # --- health & auth --------------------------------------------------------- #
@@ -93,15 +102,16 @@ def test_login_success(client):
 
 
 # --- messaging relay ------------------------------------------------------- #
-def test_direct_message_roundtrip(client):
-    register(client, "alice")
-    bob = srv.app.test_client()
+def test_direct_message_roundtrip(app):
+    alice = app.test_client()
+    register(alice, "alice")
+    bob = app.test_client()
     register(bob, "bob")
 
     # alice -> bob, plus a self-copy for alice. Distinct ciphertext per recipient.
     ct_bob = "BOB" + FAKE_CIPHERTEXT
     ct_self = "SELF" + FAKE_CIPHERTEXT
-    r = client.post("/api/send_message", json={
+    r = alice.post("/api/send_message", json={
         "type": "direct",
         "recipients": {"bob": ct_bob, "alice": ct_self},
     })
@@ -113,7 +123,7 @@ def test_direct_message_roundtrip(client):
     assert bob_msgs[0]["sender"] == "alice"
 
     # alice sees only her own self-copy.
-    alice_msgs = client.get("/api/messages").get_json()["messages"]
+    alice_msgs = alice.get("/api/messages").get_json()["messages"]
     assert [m["ciphertext"] for m in alice_msgs] == [ct_self]
 
 
@@ -123,11 +133,11 @@ def test_send_unknown_recipient_rejected(client):
     assert r.status_code == 400
 
 
-def test_send_oversized_ciphertext_rejected(client):
+def test_send_oversized_ciphertext_rejected(client, config):
     register(client, "alice")
     r = client.post("/api/send_message", json={
         "type": "direct",
-        "recipients": {"alice": "X" * (srv.MAX_CIPHERTEXT_LEN + 1)},
+        "recipients": {"alice": "X" * (config.max_ciphertext_len + 1)},
     })
     assert r.status_code == 400
 
@@ -143,9 +153,9 @@ def test_messages_since_cursor(client):
 
 
 # --- zero-knowledge contract ---------------------------------------------- #
-def test_db_never_stores_private_keys(client):
+def test_db_never_stores_private_keys(client, config):
     register(client, "alice")
-    conn = sqlite3.connect(srv.DB_PATH)
+    conn = sqlite3.connect(config.db_path)
     cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
     conn.close()
     # No column could hold a private key; the server only knows the public key.
@@ -153,7 +163,10 @@ def test_db_never_stores_private_keys(client):
     assert not any("private" in c.lower() or "secret" in c.lower() for c in cols)
 
 
-def test_server_has_no_crypto_helpers(client):
-    # The relay must not contain server-side encrypt/decrypt of messages.
-    for forbidden in ("encrypt_message", "decrypt_message", "generate_key_pair"):
-        assert not hasattr(srv, forbidden)
+def test_server_has_no_crypto_helpers():
+    # No module in the relay package may contain server-side message crypto.
+    forbidden = ("encrypt_message", "decrypt_message", "generate_key_pair")
+    for module_info in pkgutil.iter_modules(socketstream.__path__):
+        module = importlib.import_module(f"socketstream.{module_info.name}")
+        for name in forbidden:
+            assert not hasattr(module, name), f"{module_info.name}.{name} should not exist"

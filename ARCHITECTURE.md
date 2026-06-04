@@ -58,10 +58,25 @@ server.
   encrypts outgoing messages per recipient, and renders incoming ciphertext after decrypting.
   Rendering uses `textContent`, so a decrypted message can never inject HTML.
 
-### Server — `simple_secure_server.py`
+### Server — the `socketstream` package
 
-A Flask app that authenticates users and shuttles ciphertext. It imports no asymmetric-crypto
-library and has no `encrypt`/`decrypt` helpers — verified by a unit test.
+`simple_secure_server.py` is a thin entrypoint; the relay itself lives in the `socketstream`
+package, layered by concern so each piece is small and independently testable:
+
+- `config.py` — an immutable `Config` value object, read once from the environment.
+- `models.py` — the domain entities (`User`, `Message`) and the shapes they take on the wire.
+- `storage.py` — a `Database` that owns the SQLite connection + write lock, with `UserRepository`
+  and `MessageRepository` on top. Hand-written SQL, no ORM. The repositories speak in domain
+  objects, never raw rows.
+- `security.py` — a `Validator` (input limits), a `RateLimiter` (per-IP login throttle), and the
+  `login_required` decorator. Pure policy, no database access.
+- `realtime.py` — a `RealtimeGateway` wrapping Flask-SocketIO behind an interface; if the library
+  is absent it is simply `disabled` and clients fall back to polling.
+- `app.py` — the `create_app` factory wires these into a `Services` bundle on `app.extensions` and
+  registers a route blueprint whose views hold no state of their own.
+
+It authenticates users and shuttles ciphertext. It imports no asymmetric-crypto library and has no
+`encrypt`/`decrypt` helpers — verified by a unit test that scans every module in the package.
 
 - **Auth:** bcrypt password hashing; per-IP login rate limiting
   (`LOGIN_MAX_ATTEMPTS` in `LOGIN_WINDOW_SECONDS`); HttpOnly + SameSite=Lax cookies; secret key
